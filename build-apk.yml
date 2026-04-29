@@ -1,0 +1,147 @@
+name: Build APK from PWA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Create Python build script
+        run: |
+          cat > build.py << 'PYEOF'
+          import os, subprocess, shutil
+
+          # ساختار پروژه
+          os.makedirs("app/src/main/java/ir/hoshnab/app", exist_ok=True)
+          os.makedirs("app/src/main/res/values", exist_ok=True)
+
+          # AndroidManifest.xml
+          with open("app/src/main/AndroidManifest.xml", "w", encoding="utf-8") as f:
+              f.write('''<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="ir.hoshnab.app">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application
+                  android:allowBackup="true"
+                  android:label="هوش ناب"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="true">
+                  <activity android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>''')
+
+          # strings.xml
+          with open("app/src/main/res/values/strings.xml", "w", encoding="utf-8") as f:
+              f.write('<?xml version="1.0" encoding="utf-8"?><resources><string name="app_name">هوش ناب</string></resources>')
+
+          # MainActivity.java
+          with open("app/src/main/java/ir/hoshnab/app/MainActivity.java", "w", encoding="utf-8") as f:
+              f.write('''package ir.hoshnab.app;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import android.webkit.WebSettings;
+          import android.webkit.WebViewClient;
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  WebView wv = new WebView(this);
+                  WebSettings ws = wv.getSettings();
+                  ws.setJavaScriptEnabled(true);
+                  ws.setDomStorageEnabled(true);
+                  wv.setWebViewClient(new WebViewClient());
+                  wv.loadUrl("https://hoshnab.ir/");
+                  setContentView(wv);
+              }
+          }''')
+
+          print("✅ فایل‌های پروژه آماده شدند")
+          PYEOF
+
+      - name: Download Android SDK
+        run: |
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q commandlinetools-linux-*_latest.zip
+          mv cmdline-tools latest
+          yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1
+          $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager "build-tools;34.0.0" "platforms;android-34" > /dev/null 2>&1
+          echo "✅ Android SDK نصب شد"
+
+      - name: Build APK with Python
+        run: |
+          python3 build.py
+          
+          export ANDROID_HOME=$HOME/android-sdk
+          export BUILD_TOOLS=$ANDROID_HOME/build-tools/34.0.0
+          export PLATFORM=$ANDROID_HOME/platforms/android-34
+          
+          # 1. کامپایل ریسورس‌ها
+          $BUILD_TOOLS/aapt2 compile -o res.flata --dir app/src/main/res
+          $BUILD_TOOLS/aapt2 link -o base.apk -I $PLATFORM/android.jar \
+            --manifest app/src/main/AndroidManifest.xml \
+            --java gen \
+            res.flata
+          
+          # 2. کامپایل جاوا
+          mkdir -p obj
+          javac -source 1.8 -target 1.8 \
+            -cp $PLATFORM/android.jar \
+            -d obj \
+            app/src/main/java/ir/hoshnab/app/*.java
+          
+          # 3. تبدیل به DEX
+          $BUILD_TOOLS/d8 --lib $PLATFORM/android.jar --output . $(find obj -name "*.class")
+          
+          # 4. اضافه کردن به APK
+          $BUILD_TOOLS/aapt add base.apk classes.dex
+          
+          # 5. تنظیم و امضا
+          $BUILD_TOOLS/zipalign -f 4 base.apk aligned.apk
+          
+          keytool -genkey -v \
+            -keystore release.keystore \
+            -alias hoshnab \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass android123 \
+            -keypass android123 \
+            -dname "CN=HoshNab, OU=Dev, O=HoshNab, L=Tehran, ST=Tehran, C=IR"
+          
+          $BUILD_TOOLS/apksigner sign \
+            --ks release.keystore \
+            --ks-pass pass:android123 \
+            aligned.apk
+          
+          mv aligned.apk hoshnab.apk
+          echo "✅ APK ساخته شد: hoshnab.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hoshnab-apk
+          path: hoshnab.apk
